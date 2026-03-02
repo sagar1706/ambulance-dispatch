@@ -57,17 +57,9 @@ const prisma = new PrismaClient({
             : ["error"],  // Only log errors in production — query logging is very noisy
 });
 
-// ── Graceful Shutdown ─────────────────────────────────────────────
-// Called when the process receives a termination signal.
-// Closes the Prisma connection pool cleanly so Postgres sees a
-// proper disconnect (not a TCP timeout).
-const shutdown = async (signal) => {
-    console.log(`\n${signal} received. Closing Prisma connection pool...`);
-    await prisma.$disconnect();
-    process.exit(0);
-};
-
-process.on("SIGINT", () => shutdown("SIGINT"));   // Ctrl+C in terminal
-process.on("SIGTERM", () => shutdown("SIGTERM"));  // Docker stop, PM2 reload
+// ── Graceful Shutdown Note ────────────────────────────────────────
+// SIGINT/SIGTERM are handled in server.js which coordinates the full
+// shutdown order: HTTP server → Socket.IO → Prisma.
+// Signal handlers are NOT registered here to avoid conflicts.
 
 module.exports = prisma;

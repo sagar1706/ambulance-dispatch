@@ -1,21 +1,33 @@
+// ─────────────────────────────────────────────────────────────────
+// STEP 1: Load .env FIRST — before any other require
+// Why first? Other modules read process.env on require().
+// If dotenv runs after them, they get undefined values.
+// ─────────────────────────────────────────────────────────────────
 require("dotenv").config();
 
+// ─────────────────────────────────────────────────────────────────
+// STEP 2: Validate environment — crash fast if config is wrong
+// This runs before anything connects to DB or starts listening.
+// ─────────────────────────────────────────────────────────────────
+const { validateEnv } = require("./config/env");
+validateEnv();
+
+const crypto = require("crypto");
 const express = require("express");
 const http = require("http");
-const fs = require("fs");      // File system — for creating log streams
-const path = require("path");    // Path utilities — for log file paths
 const { Server } = require("socket.io");
 const cors = require("cors");
 const helmet = require("helmet");
-const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 
-
+const logger = require("./utils/logger");
 const authRoutes = require("./routes/auth.routes");
 const userRoutes = require("./routes/user.routes");
 const driverRoutes = require("./routes/driver.routes");
 const bookingRoutes = require("./routes/booking.routes");
 const adminRoutes = require("./routes/admin.routes");
+const healthRoutes = require("./routes/health.routes");
+const prisma = require("./config/prisma");
 const { initSocketIO } = require("./socket/socket");
 
 // ─────────────────────────────────────────────
@@ -32,20 +44,24 @@ const io = new Server(httpServer, {
   },
 });
 
-// Attach io to app so controllers can access it via req.app.get("io")
 app.set("io", io);
-
-// Boot Socket.IO logic
 initSocketIO(io);
 
-// ─────────────────────────────────────────────
-// Security Headers
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// Middleware 1 — Security Headers (Helmet)
+// Sets 15+ HTTP headers that browsers understand:
+//   X-Content-Type-Options: nosniff  → prevents MIME sniffing
+//   X-Frame-Options: DENY           → prevents clickjacking
+//   Strict-Transport-Security       → forces HTTPS
+//   Content-Security-Policy         → restricts script sources
+// ─────────────────────────────────────────────────────────────────
 app.use(helmet());
 
-// ─────────────────────────────────────────────
-// CORS
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// Middleware 2 — CORS
+// Only allows requests from CLIENT_URL (your frontend).
+// Any other origin gets blocked with 403 — prevents CSRF.
+// ─────────────────────────────────────────────────────────────────
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -54,124 +70,103 @@ app.use(
   })
 );
 
-// ─────────────────────────────────────────────
-// HTTP Request Logger (Morgan)
+// ─────────────────────────────────────────────────────────────────
+// Middleware 3 — Request ID
 //
-// HOW MORGAN WORKS:
-//   Morgan is a middleware that runs on every request and logs
-//   info like: method, URL, status code, response time, byte size.
+// WHAT IT DOES:
+//   Attaches a unique UUID to every incoming request:
+//     req.id = "a3f2c1b4-..."
 //
-// FORMATS:
-//   "dev"      → colorful 1-line output, great for development
-//   "combined" → Apache-style full log, standard for production
+// WHY THIS MATTERS (the key insight):
+//   When you have thousands of log lines per minute, how do you
+//   find all the logs from ONE specific request?
+//   Without request IDs — you can't. You just scroll desperately.
+//   With request IDs — filter by requestId in 2 seconds.
 //
-// FILE LOGGING (when LOG_TO_FILE=true in .env):
-//   Logs are written to:
-//   ├── logs/access.log  → all HTTP requests
-//   └── logs/error.log   → only non-2xx responses (errors)
+//   Example: A user reports "my booking failed at 2pm."
+//   They send you their X-Request-ID header from the failed response.
+//   You search your logs for that ID and instantly see:
+//     [info]  POST /api/booking received        { requestId: "abc123" }
+//     [info]  DB query: find available drivers  { requestId: "abc123" }
+//     [error] No drivers available              { requestId: "abc123" }
+//     [info]  Response: 400                     { requestId: "abc123" }
 //
-//   WHY TWO FILES:
-//   access.log grows very fast. error.log lets you quickly find
-//   problems without scrolling through thousands of 200 OK lines.
-// ─────────────────────────────────────────────
+// HOW TO SEE IT:
+//   In Postman, check the response headers for X-Request-ID.
+// ─────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  // Use the ID from client if provided (useful for frontend correlation)
+  // Otherwise generate a fresh one
+  req.id = req.headers["x-request-id"] || crypto.randomUUID();
+
+  // Send it back in the response so the client can report it
+  res.setHeader("X-Request-ID", req.id);
+  next();
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Middleware 4 — HTTP Request Logging (Winston)
+//
+// Logs every request with structured fields — replaces Morgan.
+// Silent in test environment (keeps test output clean).
+//
+// Why include requestId, ip, userAgent?
+//   - requestId → correlate with other log entries for same request
+//   - ip → security auditing (who's hitting which routes?)
+//   - userAgent → distinguish mobile app vs browser vs bots
+//   - duration → performance monitoring (slow queries = slow routes)
+// ─────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== "test") {
-  const isDev = process.env.NODE_ENV !== "production";
-  const logToFile = process.env.LOG_TO_FILE === "true";
+  app.use((req, res, next) => {
+    const start = Date.now();
 
-  if (logToFile) {
-    // Ensure the logs directory exists
-    const logsDir = path.join(__dirname, "..", "logs");
-    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+    // `res.on("finish")` fires AFTER the response is sent
+    // Only then do we know the statusCode and duration
+    res.on("finish", () => {
+      const duration = Date.now() - start;
+      const level = res.statusCode >= 500 ? "error"
+        : res.statusCode >= 400 ? "warn"
+          : "http";
 
-    // "flags: a" means append to file (don't overwrite on restart)
-    const accessStream = fs.createWriteStream(path.join(logsDir, "access.log"), { flags: "a" });
-    const errorStream = fs.createWriteStream(path.join(logsDir, "error.log"), { flags: "a" });
+      logger.log(level, `${req.method} ${req.url}`, {
+        requestId: req.id,
+        statusCode: res.statusCode,
+        durationMs: duration,
+        ip: req.ip,
+        userAgent: req.get("User-Agent"),
+      });
+    });
 
-    // Log ALL requests to access.log
-    app.use(morgan("combined", { stream: accessStream }));
-
-    // Log ONLY error responses (4xx, 5xx) to error.log
-    // The skip function returns true = skip this log entry.
-    // So: skip = (req, res) => res.statusCode < 400 means
-    // "skip logging if status is below 400" (i.e., only log errors)
-    app.use(morgan("combined", {
-      stream: errorStream,
-      skip: (req, res) => res.statusCode < 400,
-    }));
-
-    console.log("📝 Logging HTTP requests to logs/access.log and logs/error.log");
-  } else {
-    // Development: colorful console output
-    app.use(morgan(isDev ? "dev" : "combined"));
-  }
+    next();
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Global API Rate Limiter (Item 13)
-//
-// WHY A GLOBAL LIMIT ON TOP OF AUTH-SPECIFIC LIMITS:
-//   Auth routes already have tight rate limits (e.g. 10 logins/15min).
-//   But what about other routes? A malicious script could hammer
-//   GET /api/booking/my thousands of times per second, overloading
-//   your server and database — a Denial of Service (DoS) attack.
-//
-//   The global limiter is a last line of defense:
-//     Auth routes:   tight limit (5–20 requests / 15 minutes)
-//     ALL other routes: broad limit (200 requests / 15 minutes)
-//
-//   200 requests / 15 minutes is generous for real users but
-//   completely stops bots and scrapers.
-//
-// SKIP HEALTH CHECK:
-//   We skip GET / because monitoring tools like UptimeRobot hit it
-//   every 30 seconds. We don't want them getting rate limited.
-//
-// CONFIG from .env:
-//   GLOBAL_RATE_LIMIT_MAX          (default 200)
-//   GLOBAL_RATE_LIMIT_WINDOW_MS    (default 900000 = 15 min)
+// Middleware 5 — Global Rate Limiter
+// Last line of defense against DoS attacks.
+// Skips health endpoints and test environment.
 // ─────────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
   windowMs: parseInt(process.env.GLOBAL_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
   max: parseInt(process.env.GLOBAL_RATE_LIMIT_MAX) || 200,
   standardHeaders: true,
   legacyHeaders: false,
-  // Skip health check + skip entirely in test environment
-  skip: (req) => req.path === "/" || process.env.NODE_ENV === "test",
-  message: {
-    error: "Too many requests from this IP. Please slow down and try again later.",
-  },
+  skip: (req) =>
+    req.path === "/" ||
+    req.path.startsWith("/api/health") ||
+    process.env.NODE_ENV === "test",
+  message: { error: "Too many requests from this IP. Please slow down and try again later." },
 });
-
 app.use(globalLimiter);
 
 // ─────────────────────────────────────────────────────────────────
-// Body Parser + Request Size Limits (Item 14)
-//
-// WHY SIZE LIMITS:
-//   Without a size limit, someone could POST a 500MB JSON body.
-//   Your server would try to parse it, run out of memory, and crash.
-//   This is called a "payload flood" attack.
-//
-// LIMITS CHOSEN:
-//   JSON bodies:           10kb  — plenty for any legitimate API call
-//                                  (a typical booking request is ~200 bytes)
-//   URL-encoded forms:     50kb  — slightly more generous for form data
-//
-//   What if someone sends more? Express automatically returns:
-//     413 Content Too Large
-//   before even reaching your controller — zero work wasted.
-//
-// CONFIGURABLE via .env:
-//   JSON_BODY_LIMIT (default "10kb")
-//   URL_BODY_LIMIT  (default "50kb")
+// Middleware 6 — Body Parsers with Size Limits
+// Prevents payload flood attacks (e.g. 500MB POST body).
 // ─────────────────────────────────────────────────────────────────
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "10kb" }));
 app.use(express.urlencoded({ extended: true, limit: process.env.URL_BODY_LIMIT || "50kb" }));
 
-// ─────────────────────────────────────────────
 // Safety net: ensure req.body is always an object
-// Prevents crashes if client forgets Content-Type: application/json
-// ─────────────────────────────────────────────
 app.use((req, res, next) => {
   if (["POST", "PATCH", "PUT"].includes(req.method) && !req.body) {
     req.body = {};
@@ -180,8 +175,9 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────────
-// Health Check
+// Routes
 // ─────────────────────────────────────────────
+// Simple ping — not rate-limited, used by monitoring tools
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -191,9 +187,9 @@ app.get("/", (req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────
-// API Routes
-// ─────────────────────────────────────────────
+// Detailed health check — checks DB, memory, uptime
+app.use("/api/health", healthRoutes);
+
 app.use("/api/auth", authRoutes);
 app.use("/api/user", userRoutes);
 app.use("/api/driver", driverRoutes);
@@ -204,41 +200,121 @@ app.use("/api/admin", adminRoutes);
 // 404 — Unknown Routes
 // ─────────────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({
-    error: `Route ${req.method} ${req.url} not found`,
+  logger.warn("Route not found", { requestId: req.id, method: req.method, url: req.url });
+  res.status(404).json({ error: `Route ${req.method} ${req.url} not found` });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// Global Error Handler
+// Catches any error thrown by a controller that wasn't caught
+// locally. Logs it with the request ID so you can trace it.
+// ─────────────────────────────────────────────────────────────────
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  logger.error("Unhandled error", {
+    requestId: req.id,
+    error: err.message,
+    stack: err.stack,
+    method: req.method,
+    url: req.url,
+  });
+  res.status(err.status || 500).json({
+    error: err.message || "Internal Server Error",
+    requestId: req.id,   // client can report this when they file a bug
   });
 });
 
-// ─────────────────────────────────────────────
-// Global Error Handler
-// ─────────────────────────────────────────────
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err.stack);
-  res.status(err.status || 500).json({
-    error: err.message || "Internal Server Error",
+// ─────────────────────────────────────────────────────────────────
+// Graceful Shutdown v2
+//
+// WHAT HAPPENS DURING DEPLOYMENT / CONTAINER RESTART:
+//   1. OS sends SIGTERM to the process (Docker: `docker stop`)
+//   2. We stop accepting NEW connections immediately
+//   3. We wait up to 30 seconds for IN-FLIGHT requests to finish
+//   4. We close Socket.IO connections cleanly
+//   5. We disconnect the Prisma DB pool
+//   6. Process exits with code 0 (clean exit)
+//
+// WHY THIS MATTERS:
+//   Without graceful shutdown, killing the process mid-request means:
+//     - A patient's booking gets half-written to DB (corrupted)
+//     - Users get "connection reset" errors instead of proper responses
+//     - DB connections aren't closed = PostgreSQL has stale connections
+//   With graceful shutdown, all in-flight requests finish first.
+// ─────────────────────────────────────────────────────────────────
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;   // prevent double-shutdown
+  isShuttingDown = true;
+
+  logger.info(`${signal} received — starting graceful shutdown`);
+
+  // Stop accepting new connections
+  httpServer.close(async () => {
+    logger.info("HTTP server closed — no new connections accepted");
+
+    // Close Socket.IO connections
+    io.close(() => {
+      logger.info("Socket.IO closed — all WebSocket connections terminated");
+    });
+
+    // Close Prisma DB connection pool
+    try {
+      await prisma.$disconnect();
+      logger.info("Prisma disconnected — DB connection pool closed");
+    } catch (err) {
+      logger.error("Error closing Prisma", { error: err.message });
+    }
+
+    logger.info("Graceful shutdown complete");
+    process.exit(0);
   });
+
+  // Force exit after 30s if something hangs
+  // (e.g., a request that never finishes)
+  setTimeout(() => {
+    logger.error("Graceful shutdown timed out (30s) — forcing exit");
+    process.exit(1);
+  }, 30_000);
+}
+
+// Remove old SIGINT/SIGTERM handlers from prisma.js (they'd conflict)
+process.removeAllListeners("SIGINT");
+process.removeAllListeners("SIGTERM");
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Catch unhandled errors that would otherwise crash silently
+process.on("uncaughtException", (err) => {
+  logger.error("Uncaught Exception — shutting down", { error: err.message, stack: err.stack });
+  gracefulShutdown("uncaughtException");
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled Promise Rejection — shutting down", { reason: String(reason) });
+  gracefulShutdown("unhandledRejection");
 });
 
 // ─────────────────────────────────────────────────────────────────
 // Start Server
 //
-// WHY THIS PATTERN:
-//   When you run `node src/server.js`, this block runs normally.
-//   When tests do `require('./src/server')`, the module is loaded
-//   BUT the server does NOT start listening on a port — Supertest
-//   handles that itself by passing the app directly to its agent.
-//
-//   require.main === module  → true when run directly: node server.js
-//                           → false when imported: require('./server.js')
+// WHY require.main === module:
+//   node src/server.js  → require.main === module → TRUE  → starts server
+//   require('./server') → require.main === module → FALSE → doesn't start
+//   Tests use the second pattern — Supertest manages the port itself
 // ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 if (require.main === module) {
   httpServer.listen(PORT, () => {
-    console.log(`🚑 Server running on port ${PORT} [${process.env.NODE_ENV || "development"} mode]`);
-    console.log(`🔌 Socket.IO ready`);
+    logger.info(`🚑 Server started`, {
+      port: PORT,
+      env: process.env.NODE_ENV || "development",
+      version: "1.0.0",
+    });
+    logger.info("🔌 Socket.IO ready");
   });
 }
 
-// Export app so tests can import it via Supertest without starting a port listener
 module.exports = { app, httpServer };
