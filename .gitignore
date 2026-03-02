@@ -1,0 +1,22 @@
+node_modules/
+.DS_Store
+Thumbs.db
+
+# Environment variables — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Log files — can be huge, never commit
+logs/
+*.log
+npm-debug.log*
+
+# Test coverage output
+coverage/
+
+# Prisma generated files
+/generated/prisma
+
+# OS files
+.DS_Store

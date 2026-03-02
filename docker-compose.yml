@@ -1,0 +1,100 @@
+# ─────────────────────────────────────────────────────────────────
+# docker-compose.yml
+#
+# Docker Compose starts MULTIPLE containers together with one command.
+# Here we start TWO services:
+#   1. "api"      → your Node.js server (from Dockerfile)
+#   2. "postgres" → a PostgreSQL database (official image, no setup needed)
+#
+# WHY USE COMPOSE:
+#   Without compose, you'd need to manually start each container,
+#   create networks so they can talk to each other, and manage volumes
+#   for data persistence. Compose does all of this automatically.
+#
+# COMMANDS:
+#   docker-compose up --build     # build images + start all services
+#   docker-compose up -d          # start in background (detached)
+#   docker-compose down           # stop and remove containers
+#   docker-compose down -v        # also delete the database data volume
+#   docker-compose logs -f api    # follow logs for the api service
+#   docker-compose exec api sh    # open a shell inside the api container
+# ─────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  # ── Service 1: PostgreSQL Database ─────────────────────────────
+  postgres:
+    image: postgres:16-alpine        # Official PostgreSQL 16 image
+    container_name: ambulance_db
+
+    # Environment variables configure the Postgres container.
+    # These create the database, user, and password on first startup.
+    environment:
+      POSTGRES_DB: ambulance_system
+      POSTGRES_USER: ambulance_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aishwarya}  # reads from .env
+
+    # Named volume: data persists even when the container is stopped.
+    # Without this, ALL your data would be lost every time you restart.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Expose the DB port to your HOST machine for tools like
+    # pgAdmin, DBeaver, or Prisma Studio.
+    ports:
+      - "5432:5432"
+
+    # Health check: Compose waits until Postgres is truly ready
+    # before starting the API (prevents "connection refused" on startup)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ambulance_user -d ambulance_system"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Service 2: Node.js API ──────────────────────────────────────
+  api:
+    build: .                         # Build from our Dockerfile
+    container_name: ambulance_api
+
+    # Map host port 5000 → container port 5000
+    # Format: "HOST_PORT:CONTAINER_PORT"
+    ports:
+      - "${PORT:-5000}:5000"
+
+    # Environment variables injected at runtime (NOT baked into image).
+    # ${VAR:-default} reads from .env file, falls back to "default".
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      # Point to the postgres service by its service name "postgres"
+      # Docker's internal DNS resolves "postgres" to the DB container's IP.
+      DATABASE_URL: postgresql://ambulance_user:${DB_PASSWORD:-aishwarya}@postgres:5432/ambulance_system
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1d}
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+      CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
+      LOGIN_RATE_LIMIT_MAX: ${LOGIN_RATE_LIMIT_MAX:-10}
+      LOGIN_RATE_LIMIT_WINDOW_MS: ${LOGIN_RATE_LIMIT_WINDOW_MS:-900000}
+      REGISTER_RATE_LIMIT_MAX: ${REGISTER_RATE_LIMIT_MAX:-20}
+      REGISTER_RATE_LIMIT_WINDOW_MS: ${REGISTER_RATE_LIMIT_WINDOW_MS:-3600000}
+
+    # Mount a logs volume so log files persist outside the container
+    volumes:
+      - ./logs:/app/logs
+
+    # Start ONLY after postgres is healthy (not just started)
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Restart policy: restart unless you manually stop it
+    restart: unless-stopped
+
+# ── Named Volumes ────────────────────────────────────────────────
+# Docker manages this storage location automatically.
+# It persists data between container restarts/recreations.
+volumes:
+  postgres_data:
+    driver: local

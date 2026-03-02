@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────────
+# .dockerignore
+#
+# Like .gitignore but for Docker. Files listed here are NOT copied
+# into the Docker image during `docker build`.
+#
+# WHY THIS MATTERS:
+#   - node_modules: Docker installs its own (for Linux/alpine OS).
+#     Copying your local node_modules (built for Mac/Windows) would
+#     cause crashes inside the Linux container.
+#   - .env: NEVER bake secrets into Docker images. Pass them via
+#     environment variables at runtime.
+#   - logs: Container should write fresh logs, not inherit old ones.
+# ─────────────────────────────────────────────────────────────────
+
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+logs
+*.log
+.git
+.gitignore
+README.md
+ecosystem.config.js

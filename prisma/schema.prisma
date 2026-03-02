@@ -1,0 +1,115 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String               @id @default(uuid())
+  name                String
+  email               String               @unique
+  password            String
+  role                Role
+  isActive            Boolean              @default(true)
+  bookings            Booking[]
+  driver              Driver?
+  passwordResetTokens PasswordResetToken[]
+  createdAt           DateTime             @default(now())
+
+  @@index([role])
+  @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────
+// Password Reset Token
+//
+// WHY A SEPARATE TABLE (not stored in the JWT or user table):
+//   - Tokens expire after a short window (15 min)
+//   - Each token is single-use — `used` flag prevents replay
+//   - Tokens are invalidated when a new request is made
+//   - On delete: cascades so no orphan tokens pile up
+// ─────────────────────────────────────────────────────────
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique   // secure random hex string
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([token])   // looked up on every reset request
+  @@index([userId])  // to invalidate previous tokens for a user
+}
+
+
+model Driver {
+  id            String    @id @default(uuid())
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId        String    @unique   // @unique auto-creates an index
+  isAvailable   Boolean   @default(true)
+  isApproved    Boolean   @default(false)
+  vehicleNumber String?
+  currentLat    Float?
+  currentLng    Float?
+  bookings      Booking[]
+  approvedAt    DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  // Index on isAvailable: used every time we auto-assign the nearest driver.
+  // Query: WHERE isAvailable = true AND currentLat IS NOT NULL AND currentLng IS NOT NULL
+  // Without this index, every assignment scans all drivers in the table.
+  @@index([isAvailable])
+
+  // Composite index on (isAvailable, isApproved): filters available AND approved drivers
+  @@index([isAvailable, isApproved])
+}
+
+model Booking {
+  id         String        @id @default(uuid())
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  driver     Driver?       @relation(fields: [driverId], references: [id])
+  driverId   String?
+  pickupLat  Float
+  pickupLng  Float
+  status     BookingStatus @default(REQUESTED)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  // Composite index on (userId, status): used by GET /api/booking/my?status=COMPLETED
+  // Query: WHERE userId = ? AND status = ?
+  // Composite index covers BOTH columns — much faster than two separate indexes.
+  @@index([userId, status])
+
+  // Composite index on (driverId, status): used by GET /api/driver/bookings?status=
+  // Query: WHERE driverId = ? AND status = ?
+  @@index([driverId, status])
+
+  // Index on status alone: used by admin GET /api/admin/bookings?status=REQUESTED
+  @@index([status])
+
+  // Index on createdAt: used for ORDER BY createdAt DESC in every listing
+  // Without this, Postgres has to sort all matching rows in memory.
+  // With this, results come out pre-sorted from the index.
+  @@index([createdAt])
+}
+
+
+enum Role {
+  USER
+  DRIVER
+  ADMIN
+}
+
+enum BookingStatus {
+  REQUESTED
+  ASSIGNED
+  EN_ROUTE
+  ARRIVED
+  COMPLETED
+  CANCELLED
+}
