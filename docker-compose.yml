@@ -25,76 +25,84 @@ version: "3.9"
 services:
   # ── Service 1: PostgreSQL Database ─────────────────────────────
   postgres:
-    image: postgres:16-alpine        # Official PostgreSQL 16 image
+    image: postgres:16-alpine
     container_name: ambulance_db
-
-    # Environment variables configure the Postgres container.
-    # These create the database, user, and password on first startup.
     environment:
       POSTGRES_DB: ambulance_system
       POSTGRES_USER: ambulance_user
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-aishwarya}  # reads from .env
-
-    # Named volume: data persists even when the container is stopped.
-    # Without this, ALL your data would be lost every time you restart.
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aishwarya}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
-    # Expose the DB port to your HOST machine for tools like
-    # pgAdmin, DBeaver, or Prisma Studio.
     ports:
       - "5432:5432"
-
-    # Health check: Compose waits until Postgres is truly ready
-    # before starting the API (prevents "connection refused" on startup)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ambulance_user -d ambulance_system"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  # ── Service 2: Node.js API ──────────────────────────────────────
-  api:
-    build: .                         # Build from our Dockerfile
-    container_name: ambulance_api
+  # ── Service 2: Redis (dispatch queue + caching) ─────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ambulance_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    # Persist data so queue jobs survive container restarts
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-    # Map host port 5000 → container port 5000
-    # Format: "HOST_PORT:CONTAINER_PORT"
+  # ── Service 3: Node.js API ──────────────────────────────────────
+  api:
+    build: .
+    container_name: ambulance_api
     ports:
       - "${PORT:-5000}:5000"
-
-    # Environment variables injected at runtime (NOT baked into image).
-    # ${VAR:-default} reads from .env file, falls back to "default".
     environment:
       NODE_ENV: production
       PORT: 5000
-      # Point to the postgres service by its service name "postgres"
-      # Docker's internal DNS resolves "postgres" to the DB container's IP.
       DATABASE_URL: postgresql://ambulance_user:${DB_PASSWORD:-aishwarya}@postgres:5432/ambulance_system
       JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1d}
       BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
       CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
+      # Redis — "redis" is resolved by Docker's internal DNS to the redis container
+      REDIS_URL: redis://redis:6379
+      QUEUE_RETRY_DELAY_MS: ${QUEUE_RETRY_DELAY_MS:-30000}
+      QUEUE_MAX_ATTEMPTS: ${QUEUE_MAX_ATTEMPTS:-20}
+      # Rate limiting
       LOGIN_RATE_LIMIT_MAX: ${LOGIN_RATE_LIMIT_MAX:-10}
       LOGIN_RATE_LIMIT_WINDOW_MS: ${LOGIN_RATE_LIMIT_WINDOW_MS:-900000}
       REGISTER_RATE_LIMIT_MAX: ${REGISTER_RATE_LIMIT_MAX:-20}
-      REGISTER_RATE_LIMIT_WINDOW_MS: ${REGISTER_RATE_LIMIT_WINDOW_MS:-3600000}
-
-    # Mount a logs volume so log files persist outside the container
+      GLOBAL_RATE_LIMIT_MAX: ${GLOBAL_RATE_LIMIT_MAX:-200}
+      # SMTP (optional — leave blank to log to console)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      FROM_EMAIL: ${FROM_EMAIL:-}
+      # DB pool
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      LOG_TO_FILE: "true"
     volumes:
       - ./logs:/app/logs
-
-    # Start ONLY after postgres is healthy (not just started)
     depends_on:
       postgres:
         condition: service_healthy
-
-    # Restart policy: restart unless you manually stop it
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
 # ── Named Volumes ────────────────────────────────────────────────
-# Docker manages this storage location automatically.
-# It persists data between container restarts/recreations.
 volumes:
   postgres_data:
     driver: local
+  redis_data:
+    driver: local
+

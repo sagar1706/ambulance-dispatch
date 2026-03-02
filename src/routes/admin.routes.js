@@ -11,6 +11,7 @@ const {
     approveDriver,
     rejectDriver,
     getDriverPerformance,
+    getQueueStatus,
 } = require("../controllers/admin.controller");
 const { authenticateToken, authorizeRoles } = require("../middleware/auth.middleware");
 
@@ -31,9 +32,13 @@ router.patch("/users/:id/reactivate", reactivateUser);       // Unban/reactivate
 router.patch("/users/:id/role", changeUserRole);             // Change user role
 
 // ── Drivers ──
-router.get("/drivers", getAllDrivers);                        // GET all drivers (filterable)
-router.patch("/drivers/:id/approve", approveDriver);         // Approve a driver
-router.patch("/drivers/:id/reject", rejectDriver);           // Reject/revoke a driver
-router.get("/drivers/:id/performance", getDriverPerformance); // View driver stats
+router.get("/drivers", getAllDrivers);                         // GET all drivers (filterable)
+router.patch("/drivers/:id/approve", approveDriver);          // Approve a driver
+router.patch("/drivers/:id/reject", rejectDriver);            // Reject/revoke a driver
+router.get("/drivers/:id/performance", getDriverPerformance); // Driver stats
+
+// ── Dispatch Queue ──
+router.get("/queue", getQueueStatus);                         // Queue stats + waiting bookings
 
 module.exports = router;
+

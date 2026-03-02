@@ -1,4 +1,7 @@
 const prisma = require("../config/prisma");
+const logger = require("../utils/logger");
+const { findNearestDriver, assignDriverToBooking } = require("../utils/driverAssignment");
+const { addToDispatchQueue, triggerQueueProcessing } = require("../queues/dispatch.queue");
 
 // Helper — get Socket.IO instance attached to app
 const getIO = (req) => req.app.get("io");
@@ -63,21 +66,93 @@ exports.createBooking = async (req, res) => {
             },
         });
 
-        // Notify admins in real-time
         const io = getIO(req);
+
+        // ── Try immediate auto-assign ─────────────────────────────
+        // Instead of making the user wait for admin to manually assign,
+        // we immediately try to find the nearest available driver.
+        // If found    → assign right now, return 201 with driver info
+        // If not found → add to queue, return 202 (accepted, being processed)
+        const nearestDriver = await findNearestDriver(lat, lng);
+
+        if (nearestDriver) {
+            try {
+                const { booking: assignedBooking } = await assignDriverToBooking(booking.id, nearestDriver);
+
+                // Real-time notifications
+                if (io) {
+                    io.to("admins").emit("new_booking", { booking: assignedBooking });
+                    io.to(`user_${req.user.userId}`).emit("driver_assigned", {
+                        message: "Driver found and is on the way!",
+                        booking: assignedBooking,
+                        distanceKm: nearestDriver.distanceKm,
+                    });
+                    io.to(`driver_${nearestDriver.id}`).emit("new_assignment", {
+                        message: "You have a new booking",
+                        booking: assignedBooking,
+                    });
+                    io.to("admins").emit("driver_assigned", {
+                        bookingId: booking.id,
+                        driverId: nearestDriver.id,
+                    });
+                }
+
+                logger.info("Booking created and immediately assigned", {
+                    bookingId: booking.id,
+                    driverId: nearestDriver.id,
+                    distanceKm: nearestDriver.distanceKm,
+                });
+
+                return res.status(201).json({
+                    message: `Ambulance assigned and on the way! Driver is ${nearestDriver.distanceKm} km away.`,
+                    booking: assignedBooking,
+                    assigned: true,
+                });
+            } catch (assignErr) {
+                // Race condition — another booking grabbed the driver between
+                // our check and the assignment. Fall through to queue.
+                logger.warn("Immediate assignment failed (race condition) — falling back to queue", {
+                    bookingId: booking.id,
+                });
+            }
+        }
+
+        // ── No driver available — add to queue ────────────────────
+        // Notify admins about the new booking
         if (io) {
             io.to("admins").emit("new_booking", {
-                message: "New ambulance request received",
+                message: "New ambulance request — no driver currently available",
                 booking,
             });
         }
 
-        res.status(201).json({
-            message: "Ambulance requested successfully. Help is on the way!",
+        // Add to dispatch queue — worker will auto-assign when a driver frees up
+        const job = await addToDispatchQueue(booking);
+
+        // Get current queue position for user feedback
+        let queueMessage = "No drivers available right now. You've been added to the queue.";
+        if (job) {
+            // Count bookings ahead in queue
+            const queuePosition = await prisma.booking.count({
+                where: {
+                    status: "REQUESTED",
+                    createdAt: { lt: booking.createdAt },
+                },
+            });
+            queueMessage = `No drivers available. You're #${queuePosition + 1} in the queue. We'll assign a driver as soon as one is available.`;
+        }
+
+        logger.info("Booking created and added to dispatch queue", { bookingId: booking.id });
+
+        // 202 Accepted = request received and being processed (not yet fulfilled)
+        return res.status(202).json({
+            message: queueMessage,
             booking,
+            assigned: false,
+            queued: !!job,
         });
     } catch (error) {
-        console.error("Create booking error:", error);
+        logger.error("Create booking error", { error: error.message });
         res.status(500).json({ error: "Failed to create booking. Please try again." });
     }
 };
@@ -284,6 +359,9 @@ exports.cancelBooking = async (req, res) => {
                 where: { id: booking.driverId },
                 data: { isAvailable: true },
             });
+            // A driver just became free — wake up the queue to assign them
+            // to the next waiting booking
+            await triggerQueueProcessing(booking.driverId);
         }
 
         const io = getIO(req);
@@ -372,11 +450,14 @@ exports.updateBookingStatus = async (req, res) => {
         });
 
         // When completed, mark the driver as available again
+        // AND wake up the queue to assign them to a waiting booking
         if (status === "COMPLETED") {
             await prisma.driver.update({
                 where: { id: driver.id },
                 data: { isAvailable: true },
             });
+            // Trigger queue: this driver is now free, assign to next waiting booking
+            await triggerQueueProcessing(driver.id);
         }
 
         const io = getIO(req);

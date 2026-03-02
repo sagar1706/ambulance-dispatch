@@ -29,6 +29,9 @@ const adminRoutes = require("./routes/admin.routes");
 const healthRoutes = require("./routes/health.routes");
 const prisma = require("./config/prisma");
 const { initSocketIO } = require("./socket/socket");
+const { initRedis, closeRedis } = require("./config/redis");
+const { initDispatchQueue, closeDispatchQueue } = require("./queues/dispatch.queue");
+const { initDispatchWorker, closeDispatchWorker } = require("./queues/dispatch.worker");
 
 // ─────────────────────────────────────────────
 // App + HTTP Server + Socket.IO
@@ -45,6 +48,7 @@ const io = new Server(httpServer, {
 });
 
 app.set("io", io);
+global._io = io;   // make io available to the dispatch worker (outside req/res context)
 initSocketIO(io);
 
 // ─────────────────────────────────────────────────────────────────
@@ -259,6 +263,15 @@ async function gracefulShutdown(signal) {
       logger.info("Socket.IO closed — all WebSocket connections terminated");
     });
 
+    // Close dispatch worker (lets current job finish)
+    await closeDispatchWorker();
+
+    // Close dispatch queue
+    await closeDispatchQueue();
+
+    // Disconnect Redis
+    await closeRedis();
+
     // Close Prisma DB connection pool
     try {
       await prisma.$disconnect();
@@ -307,14 +320,22 @@ process.on("unhandledRejection", (reason) => {
 // ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 if (require.main === module) {
-  httpServer.listen(PORT, () => {
-    logger.info(`🚑 Server started`, {
-      port: PORT,
-      env: process.env.NODE_ENV || "development",
-      version: "1.0.0",
+  (async () => {
+    // Initialize in order: Redis → Queue → Worker → HTTP
+    await initRedis();
+    initDispatchQueue();
+    initDispatchWorker();
+
+    httpServer.listen(PORT, () => {
+      logger.info("🚑 Server started", {
+        port: PORT,
+        env: process.env.NODE_ENV || "development",
+        version: "1.0.0",
+      });
+      logger.info("🔌 Socket.IO ready");
+      logger.info("📦 Dispatch queue + worker ready");
     });
-    logger.info("🔌 Socket.IO ready");
-  });
+  })();
 }
 
 module.exports = { app, httpServer };

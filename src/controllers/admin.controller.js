@@ -1,18 +1,11 @@
 const prisma = require("../config/prisma");
+const logger = require("../utils/logger");
+const { haversineDistance } = require("../utils/driverAssignment");
+const { getQueueStats } = require("../queues/dispatch.queue");
 
-// Haversine formula — distance in km between two GPS points
-function haversineDistance(lat1, lng1, lat2, lng2) {
-    const R = 6371;
-    const toRad = (d) => (d * Math.PI) / 180;
-    const dLat = toRad(lat2 - lat1);
-    const dLng = toRad(lng2 - lng1);
-    const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
+// Helper — get Socket.IO instance from app
 const getIO = (req) => req.app.get("io");
+
 
 // ─────────────────────────────────────────────
 // GET /api/admin/bookings?status=&page=&limit=
@@ -664,7 +657,31 @@ exports.getDriverPerformance = async (req, res) => {
             },
         });
     } catch (error) {
-        console.error("Get driver performance error:", error);
+        logger.error("Get driver performance error", { error: error.message });
         res.status(500).json({ error: "Failed to fetch driver performance." });
+    }
+};
+
+// ─────────────────────────────────────────────
+// GET /api/admin/queue
+// View current dispatch queue stats
+// ─────────────────────────────────────────────
+exports.getQueueStatus = async (req, res) => {
+    try {
+        const stats = await getQueueStats();
+
+        // Also show count of REQUESTED bookings in DB (some may not be in queue yet)
+        const pendingInDb = await prisma.booking.count({
+            where: { status: "REQUESTED" },
+        });
+
+        res.json({
+            message: "Dispatch queue status",
+            pendingBookingsInDb: pendingInDb,
+            queue: stats,
+        });
+    } catch (error) {
+        logger.error("Get queue status error", { error: error.message });
+        res.status(500).json({ error: "Failed to fetch queue status." });
     }
 };

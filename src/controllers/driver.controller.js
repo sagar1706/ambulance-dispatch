@@ -1,4 +1,5 @@
 const prisma = require("../config/prisma");
+const { triggerQueueProcessing } = require("../queues/dispatch.queue");
 
 // ─────────────────────────────────────────────
 // GET /api/driver/me
@@ -126,6 +127,12 @@ exports.updateAvailability = async (req, res) => {
         updatedAt: true,
       },
     });
+
+    // If the driver just marked themselves AVAILABLE,
+    // wake up the queue — there might be a waiting booking for them
+    if (isAvailable) {
+      await triggerQueueProcessing(driver.id);
+    }
 
     res.json({
       message: `Driver is now marked as ${isAvailable ? "available" : "unavailable"}`,

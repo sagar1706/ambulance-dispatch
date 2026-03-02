@@ -67,9 +67,12 @@ describe("POST /api/booking", () => {
             .set("Authorization", `Bearer ${userToken}`)  // <-- set the auth header
             .send({ pickupLat: 19.076, pickupLng: 72.877 });
 
-        expect(res.statusCode).toBe(201);
+        // 201 = driver found and immediately assigned
+        // 202 = no driver available, booking added to queue
+        // Both are valid — depends on whether a driver has a known location in the test DB
+        expect([201, 202]).toContain(res.statusCode);
         expect(res.body.booking).toBeDefined();
-        expect(res.body.booking.status).toBe("REQUESTED");
+        expect(["REQUESTED", "ASSIGNED"]).toContain(res.body.booking.status);
         expect(res.body.booking.pickupLat).toBe(19.076);
 
         // Save the booking ID to use in later tests
